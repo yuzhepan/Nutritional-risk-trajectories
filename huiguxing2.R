@@ -70,6 +70,9 @@ conflicts_prefer(posterior::rhat)
 conflicted::conflicts_prefer(posterior::sd)
 conflicted::conflicts_prefer(purrr::map)
 conflicted::conflicts_prefer(lubridate::year)
+conflicted::conflicts_prefer(posterior::var)
+conflicted::conflicts_prefer(lubridate::month)
+conflicted::conflicts_prefer(lubridate::mday)
 
 ############ 一、聚焦 ###################
 ############ 保存结果
@@ -2072,6 +2075,8 @@ text_outcomes <- dplyr::bind_cols(
 )
 # 保存结局的数据
 saveRDS(text_outcomes, "text_outcomes1.rds")
+# 导入rds
+text_outcomes <- readRDS("text_outcomes1.rds")
 
 # 统计各列的数值分布
 table(text_outcomes$死亡)
@@ -2494,6 +2499,8 @@ cat("更新完成，当前BMS_日期为NA的记录数:",
 length(unique(bms_df$患者编号))
 # 保存数据
 saveRDS(bms_df, "bms_df.rds")
+# 导入rds
+bms_df <- readRDS("bms_df.rds")
 
 # 与 text_outcomes 合并
 # 说明：会产生“多行/就诊”（每个不同 BMS 日期一行）；未命中的就诊只保留一行，BMS_* 置 0/NA
@@ -2547,10 +2554,218 @@ text_outcomes <- text_outcomes %>%
 
 ##### 3.5.1 控制既往史 ######
 # 这样能最大程度保证减小基线差异
+# 只保留有现病史的记录
+text_df2 <- data_geren3_cleaned %>%
+  filter(!is.na(既往史)) %>%
+  select(患者编号, 就诊编号, 既往史)
+# 完整显示第1行，第10行和第49行的现病史数据
+# 使用pull函数函数显示完整文本
+cat("第1行现病史：\n")
+cat(pull(text_df2[1, "既往史"]), "\n\n")
+cat("第10行现病史：\n")
+cat(pull(text_df2[10, "既往史"]), "\n\n")
+cat("第49行现病史：\n")
+cat(pull(text_df2[49, "既往史"]), "\n\n")
+
+# 根据患者编号和就诊编号匹配入院时间
+data_huanzhe
+
+# 筛选每个患者编号最早入院时间的既往史
+
+# 提取既往史特征，形如："过敏史: 食物过敏史: 无； 药物过敏史: 无。 疾病史: 神经系统症状文本框: 无； 神经精神症状: 无； 内分泌系统症状: 无； 呼吸系统症状: 无； 循环系统症状: 无； 消化系统症状: 无； 泌尿系统症状: 无； 血液循环症状: 无； 生殖系统症状: 无； 运动系统症状: 无； 其他: 无； 呼吸系统症状内容: 无； 循环系统症状内容: 无； 消化系统症状内容: 无； 泌尿系统症状内容: 无； 血液系统症状内容: 恶性淋巴瘤病史； 内分泌系统症状内容: 糖尿病病史； 运动系统症状内容: 无。 预防接种史: 有； 平素健康状况: 良好； 传染病史: 传染病史: 无； 其他传染病史内容: 无"
+# 也如："疾病史: 神经精神症状: 无； 内分泌系统症状: 无； 呼吸系统症状: 无； 循环系统症状: 无； 消化系统症状: 无； 泌尿系统症状: 无； 血液循环症状: 无； 生殖系统症状: 无； 运动系统症状: 无； 其他: 无。 输血史: 输血史: 无； 输血反应: 无。 手术外伤史: 外伤: 无； 手术名称及时间: 数年前行子宫肌瘤摘除术； 手术: 有。 预防接种史: 无； 平素健康状况: 一般； 传染病史: 无； 过敏史: 食物过敏史: 无； 药物过敏史: 无"
+# 多以分号做分割
+
+#  1) 只保留有“既往史”，并匹配最早入院 
+# 取每个患者的“最早入院就诊编号”
+admit_min_df <- data_huanzhe %>%
+  mutate(入院日期 = as.Date(入院日期)) %>%
+  group_by(患者编号) %>%
+  slice_min(order_by = 入院日期, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(患者编号, 就诊编号, 入院日期_最早 = 入院日期)
+
+# 该就诊对应的“既往史”文本
+text_pmh_min <- text_df2 %>%
+  filter(!is.na(既往史), nzchar(既往史)) %>%
+  inner_join(admit_min_df, by = c("患者编号", "就诊编号")) %>%
+  # 若同一个最早就诊编号有多条，取第一条非空
+  group_by(患者编号, 就诊编号) %>%
+  slice(1) %>%
+  ungroup()
+
+#  2) 文本预处理 
+normalize_cn <- function(x) {
+  x %>%
+    # 统一全/半角冒号分号句号（保留中文标点优先）
+    str_replace_all("[:：]", "：") %>%
+    str_replace_all("[;；]", "；") %>%
+    str_replace_all("[.。]", "。") %>%
+    # 统一空白
+    str_replace_all("\\s+", " ") %>%
+    # 去除重复空格与首尾空格
+    str_squish()
+}
+text_pmh_min <- text_pmh_min %>%
+  mutate(既往史_norm = normalize_cn(既往史))
+
+#  3) 通用抽取函数：从“键：值；”里取值 
+# 例：extract_field("... 食物过敏史：无； 药物过敏史：阿莫西林。", "食物过敏史")
+# 返回 "无"
+#  通用抽取函数
+# 从“键：值；”中抽出值，直到 ； / 。 / 行尾
+extract_field <- function(txt, key_regex) {
+  # 先保证 txt 是字符
+  txt <- as.character(txt)
+  pattern <- stringr::str_c("(?s)(?:", key_regex, ")：\\s*(.+?)\\s*(?=；|。|$)")
+  m <- stringr::str_match(txt, pattern)
+  out <- m[, 2]
+  out <- ifelse(is.na(out) | out == "", NA_character_, stringr::str_squish(out))
+  out
+}
+
+# “是否型”标准化 
+# 识别更多否定写法：无/否/未见/未/阴性/否认/无明显/无特殊/未述/未闻/未有 等
+to_binary <- function(x) {
+  x <- str_squish(as.character(x))
+  neg_pat <- "^(无|否|未见|未|阴性|否认|无明显|无特殊|未述|未闻|未有)$"
+  ifelse(
+    is.na(x) | x == "", NA_integer_,
+    ifelse(str_detect(x, neg_pat), 0L, 1L)
+  )
+}
+
+# 逐行关键词检测（带否定窗口）
+# kw_pat: 关键词正则，如 "糖尿病|DM"
+# neg 窗口：若出现 “无/否认/未见 …(<=6 字符)… 关键词” 则判否
+has_kw_rowwise <- function(txt, kw_pat) {
+  txt <- as.character(txt)
+  pos <- str_detect(txt, kw_pat)
+  neg <- str_detect(txt, str_c("(无|否认|未见|未|否定|无明显)[^；。,.，、 ]{0,6}(", kw_pat, ")"))
+  ifelse(is.na(txt), 0L, ifelse(pos & !neg, 1L, 0L))
+}
+
+#  抽取主要板块与系统症状
+pmh_feats <- text_pmh_min %>%
+  transmute(
+    患者编号, 就诊编号, 入院日期_最早, 既往史_norm,
+    
+    # 过敏史
+    食物过敏史 = extract_field(既往史_norm, "食物过敏史"),
+    药物过敏史 = extract_field(既往史_norm, "药物过敏史"),
+    过敏史_食物_bin = to_binary(食物过敏史),
+    过敏史_药物_bin = to_binary(药物过敏史),
+    
+    # 输血史
+    输血史 = extract_field(既往史_norm, "输血史"),
+    输血反应 = extract_field(既往史_norm, "输血反应|不良反应"),
+    输血史_bin = to_binary(输血史),
+    输血反应_bin = to_binary(输血反应),
+    
+    # 手术/外伤史
+    外伤 = extract_field(既往史_norm, "外伤"),
+    手术 = extract_field(既往史_norm, "手术"),
+    手术名称及时间 = extract_field(既往史_norm, "手术名称及时间|手术名称和时间|手术名称"),
+    外伤_bin = to_binary(外伤),
+    手术_bin = to_binary(手术),
+    
+    # 预防接种、平素健康、传染病史
+    预防接种史 = extract_field(既往史_norm, "预防接种史"),
+    平素健康状况 = extract_field(既往史_norm, "平素健康状况"),
+    传染病史 = extract_field(既往史_norm, "传染病史"),
+    其他传染病史内容 = extract_field(既往史_norm, "其他传染病史内容"),
+    预防接种史_bin = to_binary(预防接种史),
+    传染病史_bin = to_binary(传染病史),
+    
+    # 系统症状（是否）与内容
+    神经精神症状 = extract_field(既往史_norm, "神经精神症状"),
+    内分泌系统症状 = extract_field(既往史_norm, "内分泌系统症状"),
+    呼吸系统症状   = extract_field(既往史_norm, "呼吸系统症状"),
+    循环系统症状   = extract_field(既往史_norm, "循环系统症状"),
+    消化系统症状   = extract_field(既往史_norm, "消化系统症状"),
+    泌尿系统症状   = extract_field(既往史_norm, "泌尿系统症状"),
+    血液系统症状   = extract_field(既往史_norm, "血液(循环|系统)症状"),
+    生殖系统症状   = extract_field(既往史_norm, "生殖系统症状"),
+    运动系统症状   = extract_field(既往史_norm, "运动系统症状"),
+    其他           = extract_field(既往史_norm, "其他"),
+    
+    神经精神症状内容   = extract_field(既往史_norm, "神经精神症状内容"),
+    内分泌系统症状内容 = extract_field(既往史_norm, "内分泌系统症状内容"),
+    呼吸系统症状内容   = extract_field(既往史_norm, "呼吸系统症状内容"),
+    循环系统症状内容   = extract_field(既往史_norm, "循环系统症状内容"),
+    消化系统症状内容   = extract_field(既往史_norm, "消化系统症状内容"),
+    泌尿系统症状内容   = extract_field(既往史_norm, "泌尿系统症状内容"),
+    血液系统症状内容   = extract_field(既往史_norm, "血液(系统|循环)症状内容"),
+    生殖系统症状内容   = extract_field(既往史_norm, "生殖系统症状内容"),
+    运动系统症状内容   = extract_field(既往史_norm, "运动系统症状内容"),
+    
+    神经精神症状_bin = to_binary(神经精神症状),
+    内分泌系统症状_bin = to_binary(内分泌系统症状),
+    呼吸系统症状_bin   = to_binary(呼吸系统症状),
+    循环系统症状_bin   = to_binary(循环系统症状),
+    消化系统症状_bin   = to_binary(消化系统症状),
+    泌尿系统症状_bin   = to_binary(泌尿系统症状),
+    血液系统症状_bin   = to_binary(血液系统症状),
+    生殖系统症状_bin   = to_binary(生殖系统症状),
+    运动系统症状_bin   = to_binary(运动系统症状)
+  )
+
+#  关键词疾病史（逐行；带否定窗口；可扩展）
+# 将多列“内容”合并为逐行文本（不使用 collapse）
+pmh_feats <- pmh_feats %>%
+  mutate(
+    全部内容_逐行 = paste(
+      神经精神症状内容, 内分泌系统症状内容, 呼吸系统症状内容,
+      循环系统症状内容, 消化系统症状内容, 泌尿系统症状内容,
+      血液系统症状内容, 生殖系统症状内容, 运动系统症状内容,
+      其他, 传染病史, 其他传染病史内容,
+      sep = " "
+    ) %>% str_squish()
+  )
+
+# 关键词：可按需补充同义词
+pmh_feats <- pmh_feats %>%
+  mutate(
+    hx_糖尿病   = has_kw_rowwise(全部内容_逐行, "糖尿病|DM"),
+    hx_高血压   = has_kw_rowwise(全部内容_逐行, "高血压|hypertension"),
+    hx_冠心病   = has_kw_rowwise(全部内容_逐行, "冠心病|缺血性心脏病|心梗|心肌梗死|CAD"),
+    hx_肝病     = has_kw_rowwise(全部内容_逐行, "肝炎|乙肝|丙肝|HBV|HCV|肝硬化|肝功能不全"),
+    hx_肾病     = has_kw_rowwise(全部内容_逐行, "肾病|肾功能不全|慢性肾病|CKD"),
+    hx_结核     = has_kw_rowwise(全部内容_逐行, "结核|TB|肺结核"),
+    hx_恶性肿瘤 = has_kw_rowwise(全部内容_逐行, "恶性肿瘤|癌|肿瘤史"),
+    hx_淋巴瘤   = has_kw_rowwise(全部内容_逐行, "淋巴瘤"),
+    hx_贫血     = has_kw_rowwise(全部内容_逐行, "贫血"),
+    hx_出血倾向 = has_kw_rowwise(全部内容_逐行, "出血|凝血障碍|血小板减少"),
+    hx_输血     = has_kw_rowwise(全部内容_逐行, "输血")
+  )
+
+# 导出到患者一级（可合并入主分析协变量）
+pmh_patient_level <- pmh_feats %>%
+  select(
+    患者编号, 入院日期_最早,
+    starts_with("过敏史_"),
+    starts_with("输血史"), starts_with("输血反应"), 外伤_bin,
+    手术_bin, 手术名称及时间,
+    预防接种史_bin, 平素健康状况, 传染病史_bin,
+    ends_with("症状_bin"),
+    # 可留存原始“内容”列便于复核（如太大可去掉）
+    # ends_with("症状内容"),
+    hx_糖尿病, hx_高血压, hx_冠心病, hx_肝病, hx_肾病,
+    hx_结核, hx_恶性肿瘤, hx_淋巴瘤, hx_贫血, hx_出血倾向, hx_输血
+  )
+
+# 查看高血压的分布
+table(pmh_patient_level$hx_高血压)
+table(pmh_patient_level$hx_恶性肿瘤)
+table(pmh_patient_level$hx_冠心病)
+table(pmh_patient_level$平素健康状况)
 
 
 
 #### 3.5.2 治疗方案（计算RDI） ####
+# 基于BMS的提取点，向前寻找化疗方案，提取化疗方案括号内的药物名称和剂量
+
+
 
 
 #### 3.5.3 移植患者的完全缓解率 ####
@@ -2723,8 +2938,7 @@ data_OS <- death_df %>%
 
 table(data_OS$os_event)
 
-# ========== 5) 基线营养对齐（索引±7天内最近一次） 
-# 基线营养匹配（索引±7天内最接近 time=0 的一条）
+# ========== 5) 基线营养对齐
 # landmark_features 列：patient, time, theta_mean(营养风险), 
 #                       age_std, sex, disease, Marital, Profession,
 #                       b0_mean(截距), slope_mean(斜率),
@@ -3266,6 +3480,166 @@ forest_plot_PFS2 <- forest_model(fit_PFS_baseline2,
 print(forest_plot_PFS2)
 dev.off()
 
+######### 3.8.1 敏感性分析 #############
+# 构造原始观测基线：来自 meas_long_tuned
+# 预期列：patient, time, y
+stopifnot(all(c("patient","time","y") %in% names(meas_long_tuned)))
+# 如果 landmark_features 里 time 是相对索引日的天数（你的 pipeline 一直就是如此），
+# 基线即 time == 0；若无精确 0，则取距离 0 最近的一次，若出现等距，优先选择 time <= 0 那个。
+obs_base_df <- meas_long_tuned %>%
+  dplyr::mutate(
+    time = suppressWarnings(as.numeric(time)),
+    d0   = abs(time - 0)
+  ) %>%
+  dplyr::group_by(patient) %>%
+  # 优先精确 time==0
+  dplyr::arrange(d0, dplyr::desc(time <= 0), .by_group = TRUE) %>%
+  dplyr::slice(1L) %>%
+  dplyr::ungroup() %>%
+  dplyr::transmute(
+    患者编号 = patient,
+    # 重命名为要求的变量名
+    nutri_obs_baseline = as.numeric(y),
+    # 可留作审计：观测时刻
+    obs_time_at_baseline = as.numeric(time)
+  )
+# 合并到 OS / PFS 数据
+data_OS2  <- data_OS2  %>% dplyr::left_join(obs_base_df, by = "患者编号")
+data_PFS2 <- data_PFS2 %>% dplyr::left_join(obs_base_df, by = "患者编号")
+data_OS3  <- data_OS3  %>% dplyr::left_join(obs_base_df, by = "患者编号")
+data_PFS3 <- data_PFS3 %>% dplyr::left_join(obs_base_df, by = "患者编号")
+
+# 用“原始观测基线”拟合 Cox（与主分析控制一致）
+fit_OS_obs  <- survival::coxph(
+  survival::Surv(os_time,  os_event)  ~ nutri_obs_baseline + age_std + sex +
+    smoke_status + alcohol_status + disease_large,
+  data = data_OS2, ties = "efron"
+)
+fit_PFS_obs <- survival::coxph(
+  survival::Surv(pfs_time, pfs_event) ~ nutri_obs_baseline + age_std + sex +
+    smoke_status + alcohol_status + disease_large,
+  data = data_PFS2, ties = "efron"
+)
+summary(fit_OS_obs);  summary(fit_PFS_obs)
+cox.zph(fit_OS_obs);  cox.zph(fit_PFS_obs)
+
+# 若只做血液肿瘤子集，直接把 data_OS2/data_PFS2 换成 data_OS3/data_PFS3 即可
+fit_OS_obs2  <- survival::coxph(
+  survival::Surv(os_time,  os_event)  ~ nutri_obs_baseline + age_std + sex +
+    smoke_status + alcohol_status + disease_small,
+  data = data_OS3, ties = "efron"
+)
+fit_PFS_obs2 <- survival::coxph(
+  survival::Surv(pfs_time, pfs_event) ~ nutri_obs_baseline + age_std + sex +
+    smoke_status + alcohol_status + disease_small,
+  data = data_PFS3, ties = "efron"
+)
+summary(fit_OS_obs2);  summary(fit_PFS_obs2)
+cox.zph(fit_OS_obs2);  cox.zph(fit_PFS_obs2)
+
+# ===== 基线后验不确定性：用 (theta_mean, theta_q025, theta_q975) 
+# 1) 取 time==0 的基线
+lf_base <- landmark_features %>%
+  dplyr::filter(time == 0) %>%
+  dplyr::rename(患者编号 = patient) %>%
+  dplyr::transmute(
+    患者编号,
+    nutri_baseline = theta_mean,
+    nutri_l95 = theta_q025,
+    nutri_u95 = theta_q975
+  )
+
+# 合并到 OS / PFS（保留你已有的控制变量）
+data_OS_2  <- data_OS2  %>% dplyr::select(-dplyr::any_of(c("nutri_baseline","nutri_l95","nutri_u95"))) %>%
+  dplyr::left_join(lf_base, by = "患者编号")
+data_PFS_2 <- data_PFS2 %>% dplyr::select(-dplyr::any_of(c("nutri_baseline","nutri_l95","nutri_u95"))) %>%
+  dplyr::left_join(lf_base, by = "患者编号")
+
+# 2) 截断正态抽样 + 多重拟合
+rtruncnorm_vec <- function(n, mean, sd, a=-Inf, b=Inf){
+  u <- runif(n)
+  pa <- pnorm((a - mean)/sd); pb <- pnorm((b - mean)/sd)
+  q <- pa + u * (pb - pa)
+  qnorm(q) * sd + mean
+}
+
+prep_src <- function(df){
+  df %>%
+    dplyr::mutate(
+      sd_approx = (nutri_u95 - nutri_l95) / 3.92,
+      sd_approx = dplyr::if_else(!is.finite(sd_approx) | sd_approx <= 0, 0.001, sd_approx)
+    )
+}
+
+data_OS_src  <- prep_src(data_OS_2)
+data_PFS_src <- prep_src(data_PFS_2)
+
+form_OS  <- survival::Surv(os_time,  os_event)  ~ nutri_baseline + age_std + sex + smoke_status + alcohol_status + disease_large
+form_PFS <- survival::Surv(pfs_time, pfs_event) ~ nutri_baseline + age_std + sex + smoke_status + alcohol_status + disease_large
+
+fit_and_collect_base <- function(dat, surv_formula, M=100L, seed=2025){
+  set.seed(seed)
+  fits <- vector("list", M)
+  for(m in 1:M){
+    draw <- rtruncnorm_vec(n = nrow(dat),
+                           mean = dat$nutri_baseline,
+                           sd   = dat$sd_approx,
+                           a    = dat$nutri_l95,
+                           b    = dat$nutri_u95)
+    dat_m <- dat; dat_m$nutri_draw_baseline <- draw
+    fits[[m]] <- survival::coxph(
+      update(surv_formula, . ~ nutri_draw_baseline + . - nutri_baseline),
+      data = dat_m, ties = "efron"
+    )
+  }
+  fits
+}
+
+pool_cox <- function(fits){
+  coef_list <- lapply(fits, coef)
+  terms <- Reduce(intersect, lapply(coef_list, names))
+  betas <- do.call(cbind, lapply(fits, function(f) coef(f)[terms]))
+  Vlist <- lapply(fits, function(f) vcov(f)[terms, terms, drop=FALSE])
+  M <- ncol(betas)
+  beta_bar <- rowMeans(betas)
+  W_bar <- Reduce(`+`, Vlist)/M
+  B <- cov(t(betas))
+  Tmat <- W_bar + (1 + 1/M)*B
+  se <- sqrt(diag(Tmat)); z <- beta_bar/se
+  data.frame(term=terms, estimate=beta_bar, std.error=se, z=z,
+             p=2*pnorm(-abs(z)), HR=exp(beta_bar),
+             HR_l95=exp(beta_bar-1.96*se), HR_u95=exp(beta_bar+1.96*se),
+             row.names=NULL)
+}
+
+fits_OS  <- fit_and_collect_base(data_OS_src,  form_OS,  M=100L, seed=42)
+fits_PFS <- fit_and_collect_base(data_PFS_src, form_PFS, M=100L, seed=42)
+
+res_OS  <- subset(pool_cox(fits_OS),  term=="nutri_draw_baseline")
+res_PFS <- subset(pool_cox(fits_PFS), term=="nutri_draw_baseline")
+print(res_OS); print(res_PFS)
+
+## 血液肿瘤患者中
+# 合并到 OS / PFS（保留你已有的控制变量）
+data_OS_3  <- data_OS3  %>% dplyr::select(-dplyr::any_of(c("nutri_baseline","nutri_l95","nutri_u95"))) %>%
+  dplyr::left_join(lf_base, by = "患者编号")
+data_PFS_3 <- data_PFS3 %>% dplyr::select(-dplyr::any_of(c("nutri_baseline","nutri_l95","nutri_u95"))) %>%
+  dplyr::left_join(lf_base, by = "患者编号")
+
+data_OS_src2  <- prep_src(data_OS_3)
+data_PFS_src2 <- prep_src(data_PFS_3)
+
+form_OS2  <- survival::Surv(os_time,  os_event)  ~ nutri_baseline + age_std + sex + smoke_status + alcohol_status + disease_small
+form_PFS2 <- survival::Surv(pfs_time, pfs_event) ~ nutri_baseline + age_std + sex + smoke_status + alcohol_status + disease_small
+
+fits_OS2  <- fit_and_collect_base(data_OS_src2,  form_OS2,  M=100L, seed=42)
+fits_PFS2 <- fit_and_collect_base(data_PFS_src2, form_PFS2, M=100L, seed=42)
+
+res_OS2  <- subset(pool_cox(fits_OS2),  term=="nutri_draw_baseline")
+res_PFS2 <- subset(pool_cox(fits_PFS2), term=="nutri_draw_baseline")
+print(res_OS2); print(res_PFS2)
+
+
 ######## 3.9 时变cox分析 #######
 
 ## ───────────────────────────────────────────────
@@ -3484,6 +3858,286 @@ fit_PFS_tv_bayes2 <- coxph(Surv(tstart, tstop, endpt) ~ nutri_tv + age_std + sex
 summary(fit_PFS_tv_bayes2)
 cox.zph(fit_PFS_tv_bayes2)
 
+## 比较滞后窗口设置的差异
+## OS 全体
+res_OS <- map_dfr(LAGS, function(L) {
+  message("Running OS, lag=", L)
+  
+  nutri_long_lag_L <- new_eval %>%
+    filter(lag == L) %>%
+    transmute(患者编号 = patient,
+              t_meas   = as.numeric(time),
+              nutri    = as.numeric(nutri_pred)) %>%
+    arrange(患者编号, t_meas)
+  
+  nutri_long_all_L <- bind_rows(nutri_long_base, nutri_long_lag_L) %>%
+    arrange(患者编号, t_meas) %>%
+    distinct(患者编号, t_meas, .keep_all = TRUE)
+  
+  tm_OS1 <- tmerge(data1 = base_OS, data2 = base_OS, id = 患者编号,
+                   endpt = event(tstop, os_event))
+  tm_OS2 <- tmerge(data1 = tm_OS1, data2 = nutri_long_all_L, id = 患者编号,
+                   nutri_tv = tdc(t_meas, nutri))
+  
+  fit <- coxph(Surv(tstart, tstop, endpt) ~ nutri_tv + age_std + sex +
+                 smoke_status + alcohol_status + disease_large,
+               data = tm_OS2, ties = "efron")
+  
+  sm <- summary(fit)
+  tibble(
+    lag = L,
+    HR  = sm$conf.int["nutri_tv","exp(coef)"],
+    LCL = sm$conf.int["nutri_tv","lower .95"],
+    UCL = sm$conf.int["nutri_tv","upper .95"],
+    p   = sm$coef["nutri_tv","Pr(>|z|)"],
+    n   = fit$n,
+    events = fit$nevent
+  )
+})
+
+print(res_OS)
+
+##PFS 全体 
+res_PFS <- map_dfr(LAGS, function(L) {
+  message("Running PFS, lag=", L)
+  
+  nutri_long_lag_L <- new_eval %>%
+    filter(lag == L) %>%
+    transmute(患者编号 = patient,
+              t_meas   = as.numeric(time),
+              nutri    = as.numeric(nutri_pred)) %>%
+    arrange(患者编号, t_meas)
+  
+  nutri_long_all_L <- bind_rows(nutri_long_base, nutri_long_lag_L) %>%
+    arrange(患者编号, t_meas) %>%
+    distinct(患者编号, t_meas, .keep_all = TRUE)
+  
+  tm_PFS1 <- tmerge(data1 = base_PFS, data2 = base_PFS, id = 患者编号,
+                    endpt = event(tstop, pfs_event))
+  tm_PFS2 <- tmerge(data1 = tm_PFS1, data2 = nutri_long_all_L, id = 患者编号,
+                    nutri_tv = tdc(t_meas, nutri))
+  
+  fit <- coxph(Surv(tstart, tstop, endpt) ~ nutri_tv + age_std + sex +
+                 smoke_status + alcohol_status + disease_large,
+               data = tm_PFS2, ties = "efron")
+  
+  sm <- summary(fit)
+  tibble(
+    lag = L,
+    HR  = sm$conf.int["nutri_tv","exp(coef)"],
+    LCL = sm$conf.int["nutri_tv","lower .95"],
+    UCL = sm$conf.int["nutri_tv","upper .95"],
+    p   = sm$coef["nutri_tv","Pr(>|z|)"],
+    n   = fit$n,
+    events = fit$nevent
+  )
+})
+
+print(res_PFS)
+
+## 做两个敏感性分析
+###### （1）LOCF（不依赖brms预测）#######
+## OS：截断到各自 tstop，进入 Cox 
+nutri_long_OS_locf <- nutri_long_base %>%
+  inner_join(base_OS %>% select(患者编号, tstop), by = "患者编号") %>%
+  filter(t_meas <= tstop) %>%
+  select(-tstop) %>%
+  arrange(患者编号, t_meas) %>%
+  distinct(患者编号, t_meas, .keep_all = TRUE)
+
+tm_OS1_locf <- tmerge(data1 = base_OS, data2 = base_OS, id = 患者编号,
+                      endpt = event(tstop, os_event))
+tm_OS2_locf <- tmerge(data1 = tm_OS1_locf, data2 = nutri_long_OS_locf, id = 患者编号,
+                      nutri_tv = tdc(t_meas, nutri))
+
+fit_OS_locf <- coxph(
+  Surv(tstart, tstop, endpt) ~ nutri_tv + age_std + sex +
+    smoke_status + alcohol_status + disease_large ,           # 个体内稳健方差
+  data = tm_OS2_locf, ties = "efron"
+)
+summary(fit_OS_locf)
+cox.zph(fit_OS_locf)
+
+## PFS：同理 
+nutri_long_PFS_locf <- nutri_long_base %>%
+  inner_join(base_PFS %>% select(患者编号, tstop), by = "患者编号") %>%
+  filter(t_meas <= tstop) %>%
+  select(-tstop) %>%
+  arrange(患者编号, t_meas) %>%
+  distinct(患者编号, t_meas, .keep_all = TRUE)
+
+tm_PFS1_locf <- tmerge(data1 = base_PFS, data2 = base_PFS, id = 患者编号,
+                       endpt = event(tstop, pfs_event))
+tm_PFS2_locf <- tmerge(data1 = tm_PFS1_locf, data2 = nutri_long_PFS_locf, id = 患者编号,
+                       nutri_tv = tdc(t_meas, nutri))
+
+fit_PFS_locf <- coxph(
+  Surv(tstart, tstop, endpt) ~ nutri_tv + age_std + sex +
+    smoke_status + alcohol_status + disease_large ,
+  data = tm_PFS2_locf, ties = "efron"
+)
+summary(fit_PFS_locf)
+cox.zph(fit_PFS_locf)
+
+## OS：截断到各自 tstop，进入 Cox，仅在血液肿瘤患者 
+nutri_long_OS_locf2 <- nutri_long_base %>%
+  inner_join(base_OS2 %>% select(患者编号, tstop), by = "患者编号") %>%
+  filter(t_meas <= tstop) %>%
+  select(-tstop) %>%
+  arrange(患者编号, t_meas) %>%
+  distinct(患者编号, t_meas, .keep_all = TRUE)
+
+tm_OS3_locf <- tmerge(data1 = base_OS2, data2 = base_OS2, id = 患者编号,
+                      endpt = event(tstop, os_event))
+tm_OS4_locf <- tmerge(data1 = tm_OS3_locf, data2 = nutri_long_OS_locf2, id = 患者编号,
+                      nutri_tv = tdc(t_meas, nutri))
+
+fit_OS_locf2 <- coxph(
+  Surv(tstart, tstop, endpt) ~ nutri_tv + age_std + sex +
+    smoke_status + alcohol_status + disease_small ,           # 个体内稳健方差
+  data = tm_OS4_locf, ties = "efron"
+)
+summary(fit_OS_locf2)
+cox.zph(fit_OS_locf2)
+
+## PFS：同理 
+nutri_long_PFS_locf2 <- nutri_long_base %>%
+  inner_join(base_PFS2 %>% select(患者编号, tstop), by = "患者编号") %>%
+  filter(t_meas <= tstop) %>%
+  select(-tstop) %>%
+  arrange(患者编号, t_meas) %>%
+  distinct(患者编号, t_meas, .keep_all = TRUE)
+
+tm_PFS3_locf <- tmerge(data1 = base_PFS2, data2 = base_PFS2, id = 患者编号,
+                       endpt = event(tstop, pfs_event))
+tm_PFS4_locf <- tmerge(data1 = tm_PFS3_locf, data2 = nutri_long_PFS_locf2, id = 患者编号,
+                       nutri_tv = tdc(t_meas, nutri))
+
+fit_PFS_locf2 <- coxph(
+  Surv(tstart, tstop, endpt) ~ nutri_tv + age_std + sex +
+    smoke_status + alcohol_status + disease_small ,
+  data = tm_PFS4_locf, ties = "efron"
+)
+summary(fit_PFS_locf2)
+cox.zph(fit_PFS_locf2)
+
+
+###### （2）后验不确定性抽取 #######
+## 工具：给定 k，取“第 k 个 draw 在所有观测上的预测”
+get_draw_vec <- function(k, theta_mat, new_eval_n) {
+  # 常见形状：draws x observations
+  if (ncol(theta_mat) == new_eval_n) {
+    v <- as.numeric(theta_mat[k, ])            # ??? 第 k 行
+  } else if (nrow(theta_mat) == new_eval_n) {
+    v <- as.numeric(theta_mat[, k])            # 另一种少见形状
+  } else {
+    stop("theta_draws_eval 的维度与 new_eval 不匹配：请检查！")
+  }
+  if (length(v) != new_eval_n) stop("抽取的向量长度与 new_eval 行数不一致")
+  if (!all(is.finite(v))) stop("抽取的后验向量存在非有限值")
+  v
+}
+
+run_one_draw_OS <- function(k, lag_pick = 14) {
+  # 1) 用第 k 个后验样本替换 nutri_pred（按行取）
+  new_eval_k <- new_eval
+  new_eval_k$nutri_pred <- get_draw_vec(k, theta_draws_eval, nrow(new_eval_k))
+  
+  # 2) 仅保留所选 lag 的滞后点
+  nutri_long_lag_k <- new_eval_k %>%
+    dplyr::filter(lag == lag_pick) %>%
+    dplyr::transmute(患者编号 = patient,
+                     t_meas = as.numeric(time),
+                     nutri  = as.numeric(nutri_pred)) %>%
+    dplyr::arrange(患者编号, t_meas) %>%
+    dplyr::distinct(患者编号, t_meas, .keep_all = TRUE)
+  
+  # 3) 合并基线 + 按 OS 截断避免前视
+  nutri_all_k_OS <- dplyr::bind_rows(nutri_long_base, nutri_long_lag_k) %>%
+    dplyr::arrange(患者编号, t_meas) %>%
+    dplyr::distinct(患者编号, t_meas, .keep_all = TRUE) %>%
+    dplyr::inner_join(base_OS %>% dplyr::select(患者编号, tstop), by = "患者编号") %>%
+    dplyr::filter(t_meas <= tstop) %>%
+    dplyr::select(-tstop)
+  
+  # 4) tmerge & Cox（稳健方差）
+  tm1 <- survival::tmerge(base_OS, base_OS, id = 患者编号, endpt = event(tstop, os_event))
+  tm2 <- survival::tmerge(tm1, nutri_all_k_OS, id = 患者编号, nutri_tv = tdc(t_meas, nutri))
+  
+  fit <- survival::coxph(
+    Surv(tstart, tstop, endpt) ~ nutri_tv + age_std + sex +
+      smoke_status + alcohol_status + disease_large +
+      cluster(患者编号),
+    data = tm2, ties = "efron"
+  )
+  
+  sm <- summary(fit)
+  beta <- sm$coef["nutri_tv", "coef"]          # log(HR)
+  se   <- sm$coef["nutri_tv", "robust se"]     # ??? 用稳健SE
+  tibble::tibble(draw = k, beta = beta, se = se, HR = exp(beta))
+}
+
+run_one_draw_PFS <- function(k, lag_pick = 14) {
+  new_eval_k <- new_eval
+  new_eval_k$nutri_pred <- get_draw_vec(k, theta_draws_eval, nrow(new_eval_k))
+  
+  nutri_long_lag_k <- new_eval_k %>%
+    dplyr::filter(lag == lag_pick) %>%
+    dplyr::transmute(患者编号 = patient,
+                     t_meas = as.numeric(time),
+                     nutri  = as.numeric(nutri_pred)) %>%
+    dplyr::arrange(患者编号, t_meas) %>%
+    dplyr::distinct(患者编号, t_meas, .keep_all = TRUE)
+  
+  nutri_all_k_PFS <- dplyr::bind_rows(nutri_long_base, nutri_long_lag_k) %>%
+    dplyr::arrange(患者编号, t_meas) %>%
+    dplyr::distinct(患者编号, t_meas, .keep_all = TRUE) %>%
+    dplyr::inner_join(base_PFS %>% dplyr::select(患者编号, tstop), by = "患者编号") %>%
+    dplyr::filter(t_meas <= tstop) %>%
+    dplyr::select(-tstop)
+  
+  tm1 <- survival::tmerge(base_PFS, base_PFS, id = 患者编号, endpt = event(tstop, pfs_event))
+  tm2 <- survival::tmerge(tm1, nutri_all_k_PFS, id = 患者编号, nutri_tv = tdc(t_meas, nutri))
+  
+  fit <- survival::coxph(
+    Surv(tstart, tstop, endpt) ~ nutri_tv + age_std + sex +
+      smoke_status + alcohol_status + disease_large +
+      cluster(患者编号),
+    data = tm2, ties = "efron"
+  )
+  
+  sm <- summary(fit)
+  beta <- sm$coef["nutri_tv", "coef"]
+  se   <- sm$coef["nutri_tv", "robust se"]
+  tibble::tibble(draw = k, beta = beta, se = se, HR = exp(beta))
+}
+
+set.seed(123)
+draw_ids <- sample(seq_len(nrow(theta_draws_eval)), K)  # ??? 用行数更稳妥
+
+res_OS_draws  <- purrr::map_dfr(draw_ids, run_one_draw_OS)
+res_PFS_draws <- purrr::map_dfr(draw_ids, run_one_draw_PFS)
+
+pool_rubin <- function(beta_vec, se_vec) {
+  m   <- length(beta_vec)
+  Qb  <- mean(beta_vec)                 # 平均logHR
+  U   <- mean(se_vec^2)                 # 组内方差均值
+  B   <- stats::var(beta_vec)           # 组间方差
+  Tva <- U + (1 + 1/m) * B              # 总方差
+  se  <- sqrt(Tva)
+  c(beta = Qb, se = se,
+    HR  = exp(Qb),
+    LCL = exp(Qb - 1.96*se),
+    UCL = exp(Qb + 1.96*se))
+}
+
+pool_OS  <- pool_rubin(res_OS_draws$beta,  res_OS_draws$se)
+pool_PFS <- pool_rubin(res_PFS_draws$beta, res_PFS_draws$se)
+
+pool_OS; pool_PFS
+summary(res_OS_draws$HR); summary(res_PFS_draws$HR)  # 看每次拟合的HR分布是否稳定
+
+
 #### 可视化
 # 森林图
 library(forestploter)  
@@ -3494,6 +4148,9 @@ fit_OS_tv_bayes1  <- update(fit_OS_tv_bayes1,  data = tm_OS2,  x = TRUE, y = TRU
 fit_PFS_tv_bayes1 <- update(fit_PFS_tv_bayes1, data = tm_PFS2, x = TRUE, y = TRUE, model = TRUE)
 fit_OS_tv_bayes2  <- update(fit_OS_tv_bayes2,  data = tm_OS4,  x = TRUE, y = TRUE, model = TRUE)
 fit_PFS_tv_bayes2 <- update(fit_PFS_tv_bayes2, data = tm_PFS4, x = TRUE, y = TRUE, model = TRUE)
+
+fit_OS_locf <- update(fit_OS_locf, data = tm_OS2_locf, x = TRUE, y = TRUE, model = TRUE)
+fit_PFS_locf <- update(fit_PFS_locf,data = tm_PFS2_locf, x = TRUE, y = TRUE, model = TRUE)
 
 ## 森林图，用ggforest包
 # 通用封装：列名英文 + 样式一致
@@ -3532,6 +4189,7 @@ pdf("forest_PFS_时变血液肿瘤.pdf", width = 15, height = 10)
 print(plot_ggforest(fit_PFS_tv_bayes2, tm_PFS4, "PFS (Hematologic only)"))
 dev.off()
 
+ 
 # 效应曲线
 library(splines)
 library(dplyr)
@@ -3648,57 +4306,217 @@ dev.off()
 ######### 提取了个人史似乎还没有派上用场，记得在前面可以考虑加入吸烟饮酒情况作为人口学协变量
 #######  4.1尝试做骨髓抑制的分析 #########
 # text_outcomes中BMS_event为1或0，表示是否发生骨髓抑制，伴有BMS_日期
-# 索引日（最早入院）
-index_date_df <- text_outcomes %>%
+# 找寻一些异常的入院日期
+# 找寻data_geren2中患者编号为0000003102的行
+result <- text_outcomes[text_outcomes$患者编号 == "0018695335", ]
+# 检查是否存在BMS日期小于最小入院日期的患者编号
+# 首先计算每位患者的最小入院日期
+min_admission_date <- text_outcomes %>%
   group_by(患者编号) %>%
-  summarise(index_date = min(as.Date(入院日期), na.rm = TRUE), .groups = "drop")
+  summarise(
+    min_admission = min(入院日期, na.rm = TRUE),
+    .groups = "drop"
+  )
+# 计算每位患者的BMS日期 
+bms_dates <- text_outcomes %>%
+  group_by(患者编号) %>%
+  summarise(
+    min_bms_date = min(BMS_日期, na.rm = TRUE),
+    .groups = "drop"
+  )
+# 合并数据并检查异常情况
+abnormal_patients <- min_admission_date %>%
+  left_join(bms_dates, by = "患者编号") %>%
+  filter(!is.na(min_bms_date) & !is.na(min_admission)) %>%
+  mutate(bms_before_admission = min_bms_date < min_admission) %>%
+  filter(bms_before_admission == TRUE)
+# 显示异常患者列表
+print(abnormal_patients)
+# 统计异常患者数量
+cat("BMS日期早于最早入院日期的患者数量:", nrow(abnormal_patients), "\n")
+# 在text_df中选择这些异常的患者编号的行
+abnormal_patient_records <- text_df %>%
+  filter(患者编号 %in% abnormal_patients$患者编号)%>%
+  arrange(患者编号)
 
-# 每位患者的BMS：是否发生 & 最早BMS日期 & 最高分级/是否重度
-# 第一步：获取所有患者的BMS汇总（保留所有患者）
+############# 事实上，文本提取也可能存在问题，因为有的病史记录中的骨髓抑制可能是在第一次入院之前发生的，，我们
+# 1) 统一/稳健地解析日期
+# 通用解析函数：支持多种格式，返回 Date
+parse_date_safe <- function(x) {
+  # 若已是 Date，直接返回
+  if (inherits(x, "Date")) return(x)
+  # 转字符
+  xc <- as.character(x)
+  
+  # 先尝试常见完整格式
+  d1 <- suppressWarnings(parse_date_time(xc,
+                                         orders = c("Ymd","Y-m-d","Y/m/d",
+                                                    "d/m/Y","d-m-Y","m/d/Y","m-d-Y",
+                                                    "d.b.Y","d.b.y","Y.b.d"),
+                                         tz = "UTC"))
+  # 如果还没解析出来，再尝试只有月日（无年份）的格式，先用虚拟年 1970
+  need_md <- is.na(d1) & str_detect(xc, "^[0-9]{1,2}[/.-][0-9]{1,2}$")
+  if (any(need_md)) {
+    d_tmp <- suppressWarnings(parse_date_time(xc[need_md],
+                                              orders = c("d/m","m/d","d-m","m-d","d.b","m.b"),
+                                              tz = "UTC"))
+    # 补一个虚拟年份（1970），后面再按参考日期修正
+    d1[need_md] <- update(d_tmp, year = 1970)
+  }
+  as.Date(d1)
+}
+
+# 2) 索引日（最早入院）
+index_date_df <- text_outcomes %>%
+  mutate(入院日期_parsed = parse_date_safe(入院日期)) %>%
+  group_by(患者编号) %>%
+  summarise(index_date = suppressWarnings(min(入院日期_parsed, na.rm = TRUE)),
+            .groups = "drop")
+
+# 3) 每位患者的BMS汇总
 bms_all <- text_outcomes %>%
+  mutate(
+    入院日期_parsed = parse_date_safe(入院日期),
+    BMS_日期_parsed = parse_date_safe(BMS_日期)
+  ) %>%
   group_by(患者编号) %>%
   summarise(
     BMS_event = as.integer(any(BMS_event == 1L, na.rm = TRUE)),
-    BMS_grade = suppressWarnings(max(BMS_grade, na.rm = TRUE)),   
-    admission_date = first(入院日期),
+    BMS_grade = suppressWarnings(max(BMS_grade, na.rm = TRUE)),
+    # 入院日改为最早入院而不是 first，避免顺序问题
+    admission_date = suppressWarnings(min(入院日期_parsed, na.rm = TRUE)),
     .groups = "drop"
   )
 
-# 第二步：计算入院后最早BMS日期（仅用于有BMS事件的患者）
+# 4) 计算最早 BMS 日期（按行先解析后取最小）
 bms_dates <- text_outcomes %>%
-  filter(BMS_日期 > 入院日期 | is.na(入院日期)) %>%
+  mutate(BMS_日期_parsed = parse_date_safe(BMS_日期)) %>%
   group_by(患者编号) %>%
   summarise(
-    BMS_date = suppressWarnings(min(BMS_日期, na.rm = TRUE)),
+    BMS_date_raw = suppressWarnings(min(BMS_日期_parsed, na.rm = TRUE)),
     .groups = "drop"
-  ) %>%
-  mutate(BMS_date = as.Date(as.character(BMS_date)))
+  )
 
-# 合并结果
+# 5) 合并 
 bms_outcome <- bms_all %>%
   left_join(bms_dates, by = "患者编号") %>%
-  # 对于没有入院后BMS事件但有BMS事件的患者，BMS_date将为NA
-  # 对于完全没有BMS事件的患者，BMS_date也将为NA（这是正确的）
-  select(患者编号, BMS_event, BMS_date, BMS_grade)
+  left_join(index_date_df, by = "患者编号") %>%
+  # 兼容旧列名：admission_date 就是 index_date（若 admission_date 为 NA 用 index_date）
+  mutate(admission_date = coalesce(admission_date, index_date)) %>%
+  select(患者编号, BMS_event, BMS_grade, admission_date, BMS_date = BMS_date_raw)
 
-# 每位患者的BMS：是否发生 & 最早BMS日期 & 最高分级/是否重度（不做日期筛选，事实上有的患者的入院日期大于患者BMS的日期）
-bms_outcome <- text_outcomes %>%
-  group_by(患者编号) %>%
-  summarise(
-    BMS_event = as.integer(any(BMS_event == 1L, na.rm = TRUE)),
-    BMS_date  = suppressWarnings(min(BMS_日期, na.rm = TRUE)),
-    BMS_grade = suppressWarnings(max(BMS_grade, na.rm = TRUE)),   
-    .groups = "drop"
-  ) %>%
-  # 确保日期格式正确
+#  6) 异常修补逻辑 
+# 规则：
+# - 目标：BMS_date 修正到“入院日之后的最近一个同月同日”
+# - 如果原始 BMS_date 只有月日（我们用 1970 占位），按 admission_date 的年份补齐；
+# - 若补到同年仍早于入院日，则顺延 +1 年；
+# - 若顺延后距离入院超过阈值 max_after（默认 180 天），认为不可信，保留原值。
+
+repair_bms_date <- function(bms_date, admission_date, max_after = 120) {
+  if (is.na(bms_date) || is.na(admission_date)) return(bms_date)
+  
+  # 若已正常（入院日当天或之后），直接返回
+  if (bms_date >= admission_date) return(bms_date)
+  
+  # 仅保留月、日信息（适用于“无年份或年份错误”的场景）
+  mm <- month(bms_date)
+  dd <- mday(bms_date)
+  if (is.na(mm) || is.na(dd)) return(bms_date)
+  
+  # 先尝试用入院年份
+  cand <- suppressWarnings(make_date(year(admission_date), mm, dd))
+  
+  # 如果补年后仍早于入院，则顺延一年
+  if (!is.na(cand) && cand < admission_date) {
+    cand <- cand %m+% years(1)
+  }
+  
+  # 检查窗口（避免把很久以前的日期硬拉到次年变成“未来很远”）
+  if (!is.na(cand) && difftime(cand, admission_date, units = "days") <= max_after) {
+    return(cand)
+  } else {
+    # 超出窗口则保留原值，避免引入错误
+    return(bms_date)
+  }
+}
+
+# 应用修补（仅对异常行）
+bms_outcome <- bms_outcome %>%
   mutate(
-    BMS_date = as.Date(as.character(BMS_date)),
-    # 或者如果是数值型日期：
-    # BMS_date = ifelse(is.finite(as.numeric(BMS_date)) & !is.na(BMS_date),
-    #                   as.Date(as.numeric(BMS_date), origin = "1970-01-01"),
-    #                   as.Date(NA))
+    BMS_date_fixed = if_else(
+      !is.na(BMS_date) & !is.na(admission_date) & (BMS_date < admission_date),
+      as.Date(mapply(repair_bms_date, BMS_date, admission_date, MoreArgs = list(max_after = 180))),
+      BMS_date
+    )
   )
-table(bms_outcome$BMS_event)
+
+# 7) 检查修补效果 
+abnormal_before <- bms_outcome %>%
+  filter(!is.na(BMS_date) & !is.na(admission_date) & BMS_date < admission_date)
+
+abnormal_after <- bms_outcome %>%
+  filter(!is.na(BMS_date_fixed) & !is.na(admission_date) & BMS_date_fixed < admission_date)
+
+cat("修补前：发现", nrow(abnormal_before), "个异常病例（BMS日期早于入院日期）\n")
+cat("修补后：剩余", nrow(abnormal_after), "个异常病例\n")
+
+# 8) 对仍异常者：清零事件/分级，并将日期标为“Inf”
+# 仍异常（修补后依然早于入院）
+abn_idx <- !is.na(bms_outcome$BMS_date_fixed) &
+  !is.na(bms_outcome$admission_date) &
+  bms_outcome$BMS_date_fixed < bms_outcome$admission_date
+
+n_abn <- sum(abn_idx, na.rm = TRUE)
+
+if (n_abn > 0) {
+  # 使用哨兵日期 + 标记
+  sentinel_date <- as.Date("9999-12-31")
+  
+  bms_outcome <- bms_outcome %>%
+    mutate(
+      BMS_event = if_else(abn_idx, 0L, BMS_event),
+      # max() 产生过 -Inf 的情况一并兜底成 0
+      BMS_grade = if_else(abn_idx | is.infinite(BMS_grade), 0, BMS_grade),
+      BMS_date_fixed = if_else(abn_idx, sentinel_date, BMS_date_fixed),
+      BMS_date_is_inf = if_else(abn_idx, TRUE, FALSE)
+    )
+} else {
+  bms_outcome <- bms_outcome %>%
+    mutate(BMS_date_is_inf = FALSE)
+}
+
+# 最终导出列：把 fixed 列作为最终日期
+bms_outcome <- bms_outcome %>%
+  transmute(
+    患者编号,
+    BMS_event = as.integer(BMS_event),
+    BMS_grade = as.numeric(BMS_grade),
+    admission_date,
+    BMS_date = BMS_date_fixed,
+    BMS_date_is_inf
+  )
+
+cat("已将", n_abn, "条仍异常的记录：BMS_event/BMS_grade 置 0，BMS_date 置为 9999-12-31，并标记为 Inf（BMS_date_is_inf=TRUE）。\n")
+
+#### 再人工复核一下
+# 选择BMS_date为9999-12-31的行
+sentinel_dates <- bms_outcome %>%
+  filter(BMS_date == as.Date("9999-12-31"))
+# 提取text_df每个患者编号的现病史最长的行
+last_visits <- text_df %>%
+     group_by(患者编号) %>%
+     slice_max(order_by = nchar(现病史), n = 1) %>%
+     ungroup() %>%
+     select(患者编号, 现病史)
+# 匹配
+# 找出BMS_date为9999-12-31的患者在last_visits中的信息
+sentinel_patient_info <- last_visits %>%
+  filter(患者编号 %in% sentinel_dates$患者编号)
+### 结果发现，这些记录确实都存在问题，这些患者编号需要标明，他们的骨髓抑制的发生在首次入院中南医院之前，因此我们的研究排除他们是对的，不只是需要标零，看
+# 是否需要在这里剔除这些患者，如果剔除后结果不好，可以再重新计算得到bms_outcome
+# 尝试剔除择BMS_date为9999-12-31的行，剔除后分析BMS的发生率模型，结果无变化，因此不用剔除
+
+###### 4.1.1处理营养数据 ########
 # 从 landmark_features 取基线营养与主要协变量
 nutri_base_df <- landmark_features %>%
   dplyr::rename(患者编号 = patient) %>%
@@ -3708,20 +4526,6 @@ nutri_base_df <- landmark_features %>%
     nutri_baseline = theta_mean,
     age_std, sex, disease, Marital, Profession
   )
-
-time_df <- index_date_df %>%
-  left_join(select(data_OS2, 患者编号, os_time, os_event), by = "患者编号") %>%
-  left_join(select(bms_outcome, 患者编号, BMS_date), by = "患者编号") %>%
-  mutate(
-    follow_end = as.numeric(os_time),                                  # 随访总时长（天/你当前单位）
-    bms_time   = as.numeric(BMS_date - index_date),                    # BMS至索引日的时长
-    # 仅保留在随访窗内的 BMS
-    bms_time   = ifelse(is.finite(bms_time) & bms_time >= 0 &
-                          bms_time <= follow_end, bms_time, NA_real_)
-  )
-
-
-
 # 把disease区分一下
 # 把 12 类疾病映射为 5 大类 + 血液/非血液标签
 # 现有 data_OS / data_PFS 已含: 患者编号, os_time, os_event, pfs_time, pfs_event,nutri_baseline, age_std, sex, disease(因子，水平是 1..12)
@@ -3804,22 +4608,53 @@ covar_df <- index_date_df %>%
     sex     = as.factor(sex)
   )
 
-
-# 主数据集（一个患者一行）
+str(index_date_df)
+str(bms_outcome)
+# 事件指示：有有效 BMS_time 视为事件=1，否则=0
+time_df <- index_date_df %>%
+  left_join(select(data_OS2, 患者编号, os_time, os_event), by = "患者编号") %>%
+  left_join(select(bms_outcome, 患者编号, BMS_date), by = "患者编号") %>%
+  mutate(
+    follow_end = as.numeric(os_time),                 # 总随访时长
+    bms_time   = as.numeric(BMS_date - index_date),   # 事件发生到索引日
+    bms_time   = ifelse(is.finite(bms_time) & bms_time >= 0 &
+                          bms_time <= follow_end, bms_time, NA_real_),
+    BMS_y      = as.integer(!is.na(bms_time)),        # 事件指示 1/0
+    pt         = pmax(follow_end, 0.0)                # person-time（天）
+  )
+# 合并协变量
 dat_bms_base <- covar_df %>%
-  left_join(bms_outcome, by = "患者编号") %>%
-  # 只保留有随访信息的（若你有last_follow，可再加限制）
-  filter(!is.na(BMS_event))
+  left_join(time_df %>% select(患者编号, BMS_y, pt), by = "患者编号") %>%
+  filter(!is.na(BMS_y), is.finite(pt), pt >= 0)
+# 处理 offset 里 log(0) 的情况：丢弃 pt==0 或加极小值
+dat_bms_base <- dat_bms_base %>%
+  mutate(pt = ifelse(pt == 0, NA_real_, pt)) %>%
+  filter(!is.na(pt))
 
+library(sandwich)
+library(lmtest)
 # 拟合（协变量按可用性自动进入）
-form_base <- as.formula(
-  paste0("BMS_event ~ nutri_baseline + age_std + sex + disease_large",
-         if ("smoke_status" %in% names(dat_bms_base))   " + smoke_status"   else "",
-         if ("alcohol_status" %in% names(dat_bms_base)) " + alcohol_status" else "")
+# Poisson + offset(log(pt))：估 IRR 
+form_rate <- as.formula(
+  paste0("BMS_y ~ nutri_baseline + age_std + sex + smoke_status + alcohol_status + disease_large + offset(log(pt))")
 )
 
-fit_bms_logit_base <- glm(form_base, data = dat_bms_base, family = binomial())
-summary(fit_bms_logit_base)
+fit_poisson <- glm(form_rate, data = dat_bms_base, family = poisson())
+summary(fit_poisson)
+
+# 稳健方差（推荐）
+fit_vcovHC <- vcovHC(fit_poisson, type = "HC0")
+po_out <- coeftest(fit_poisson, vcov = fit_vcovHC)
+
+# IRR 及其 95% CI（基于稳健方差的正态近似）
+irr <- exp(coef(fit_poisson))
+se  <- sqrt(diag(fit_vcovHC))
+irr_ci_lo <- exp(coef(fit_poisson) - 1.96*se)
+irr_ci_hi <- exp(coef(fit_poisson) + 1.96*se)
+
+# 打印结果
+print(po_out)
+print(data.frame(Effect = names(irr), IRR = irr, CI_lo = irr_ci_lo, CI_hi = irr_ci_hi), row.names = FALSE)
 
 # 只在血液肿瘤患者中计算
 # 只保留disease_large为1的行(血液肿瘤患者)
@@ -3827,13 +4662,32 @@ dat_bms_base2 <- dat_bms_base[dat_bms_base$disease_large == 1, ]
 # 重新设置因子水平
 dat_bms_base2$disease_small <- factor(dat_bms_base2$disease_small, 
                                  levels = c("1", "2", "3", "4"))
-# 拟合（协变量按可用性自动进入）
-form_base2 <- as.formula(
-  paste0("BMS_event ~ nutri_baseline + age_std + sex + + smoke_status + alcohol_status + disease_small")
+# 拟合
+# Poisson + offset(log(pt))：估 IRR 
+form_rate2 <- as.formula(
+  paste0("BMS_y ~ nutri_baseline + age_std + sex + smoke_status + alcohol_status + disease_small + offset(log(pt))")
 )
 
-fit_bms_logit_base2 <- glm(form_base2, data = dat_bms_base2, family = binomial())
-summary(fit_bms_logit_base2)
+fit_poisson2 <- glm(form_rate2, data = dat_bms_base2, family = poisson())
+summary(fit_poisson2)
+
+# 稳健方差（推荐）
+fit_vcovHC <- vcovHC(fit_poisson2, type = "HC0")
+po_out <- coeftest(fit_poisson2, vcov = fit_vcovHC)
+# IRR 及其 95% CI（基于稳健方差的正态近似）
+irr <- exp(coef(fit_poisson2))
+se  <- sqrt(diag(fit_vcovHC))
+irr_ci_lo <- exp(coef(fit_poisson2) - 1.96*se)
+irr_ci_hi <- exp(coef(fit_poisson2) + 1.96*se)
+# 打印结果
+print(po_out)
+print(data.frame(Effect = names(irr), IRR = irr, CI_lo = irr_ci_lo, CI_hi = irr_ci_hi), row.names = FALSE)
+
+
+######### 4.2探究营养风险对骨髓移植缓解好转的影响 ############
+
+
+
 
 
 # LAGS 可按需要调整
